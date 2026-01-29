@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Choose the type of build." FORCE)
 endif()
 
 include(FetchContent)
@@ -23,7 +23,8 @@ if(NOT Arrow_FOUND OR NOT Parquet_FOUND)
   message(STATUS "Arrow/Parquet not found. Fetching Apache Arrow...")
   set(ARROW_BUILD_SHARED ON CACHE BOOL "" FORCE)
   set(ARROW_BUILD_STATIC OFF CACHE BOOL "" FORCE)
-  set(ARROW_IPC ON CACHE BOOL "" FORCE)
+  # IPC not needed for this project; keep OFF to reduce build time.
+  set(ARROW_IPC OFF CACHE BOOL "" FORCE)
   set(ARROW_PARQUET ON CACHE BOOL "" FORCE)
   set(ARROW_SIMD_LEVEL "NONE" CACHE STRING "" FORCE)
   set(ARROW_WITH_BZ2 OFF CACHE BOOL "" FORCE)
