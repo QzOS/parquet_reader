@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 project(pq_reader LANGUAGES CXX)
 
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -46,6 +47,7 @@ if(NOT Arrow_FOUND OR NOT Parquet_FOUND)
   FetchContent_MakeAvailable(arrow)
 endif()
 
+# Some Arrow builds export different target names; these aliases keep the rest stable.
 if(TARGET arrow_shared AND NOT TARGET Arrow::arrow_shared)
   add_library(Arrow::arrow_shared ALIAS arrow_shared)
 endif()
@@ -85,10 +87,6 @@ endif()
 
 add_library(pq_reader SHARED
   parquet_f32.cpp
-)
-
-set_target_properties(pq_reader PROPERTIES
-  POSITION_INDEPENDENT_CODE ON
 )
 
 target_include_directories(pq_reader PUBLIC

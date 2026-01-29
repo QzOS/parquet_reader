@@ -1,5 +1,6 @@
 #include "parquet_f32.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -210,6 +211,7 @@ static double timestamp_value_to_seconds(const arrow::TimestampType& ts_type, in
     }
 }
 
+// NOTE: fill_x_buf() kept for reference/debug; main path uses fill_x_buf_into() via chunk-aware copy.
 static void fill_x_buf(pqh* h,
     const std::shared_ptr<arrow::Array>& arr,
     int64_t row0,
@@ -388,6 +390,7 @@ static int find_rg_for_row(const pqh* h, int64_t row) {
     return lo;
 }
 
+// Copy numeric chunked column slice into float32 output (NaN for nulls).
 static int copy_chunked_to_f32_into(
     const std::shared_ptr<arrow::ChunkedArray>& chunked,
     int64_t src_off,
@@ -397,6 +400,7 @@ static int copy_chunked_to_f32_into(
 
     if (!chunked || !dst) return -1;
     if (nrows <= 0) return 0;
+    if (src_off < 0) return -2;
 
     int64_t remaining = (int64_t)nrows;
     int64_t src = src_off;
@@ -405,18 +409,21 @@ static int copy_chunked_to_f32_into(
     int64_t base = 0;
     const int nch = chunked->num_chunks();
     for (int ci = 0; ci < nch && remaining > 0; ci++) {
-        auto arr = chunked->chunk(ci);
-        if (!arr) continue;
+        const std::shared_ptr<arrow::Array> arr = chunked->chunk(ci);
+        if (!arr) {
+            continue;
+        }
 
         const int64_t len = arr->length();
         const int64_t chunk_start = base;
-        const int64_t chunk_end = base + len;
+        const int64_t chunk_end = base + len; // exclusive
 
         if (src >= chunk_end) {
             base = chunk_end;
             continue;
         }
         if (src < chunk_start) {
+            // Defensive: should not happen if base tracking is correct.
             src = chunk_start;
         }
 
@@ -435,9 +442,11 @@ static int copy_chunked_to_f32_into(
         base = chunk_end;
     }
 
+    // If remaining > 0, the caller asked beyond available data; leave the tail as-is.
     return 0;
 }
 
+// Copy time chunked column slice into x_buf (double seconds, NaN for nulls).
 static void copy_chunked_time_into(
     pqh* h,
     const std::shared_ptr<arrow::ChunkedArray>& chunked,
@@ -447,6 +456,7 @@ static void copy_chunked_time_into(
 
     if (!h || !chunked) return;
     if (nrows <= 0) return;
+    if (src_off < 0) return;
 
     int64_t remaining = (int64_t)nrows;
     int64_t src = src_off;
@@ -455,18 +465,22 @@ static void copy_chunked_time_into(
     int64_t base = 0;
     const int nch = chunked->num_chunks();
     for (int ci = 0; ci < nch && remaining > 0; ci++) {
-        auto arr = chunked->chunk(ci);
-        if (!arr) continue;
+        const std::shared_ptr<arrow::Array> arr = chunked->chunk(ci);
+        if (!arr) {
+            continue;
+        }
 
         const int64_t len = arr->length();
         const int64_t chunk_start = base;
-        const int64_t chunk_end = base + len;
+        const int64_t chunk_end = base + len; // exclusive
 
         if (src >= chunk_end) {
             base = chunk_end;
             continue;
         }
-        if (src < chunk_start) src = chunk_start;
+        if (src < chunk_start) {
+            src = chunk_start;
+        }
 
         const int64_t in_chunk_off = src - chunk_start;
         const int64_t avail = len - in_chunk_off;
@@ -600,20 +614,6 @@ int pq_read_rows_f32(
             return -20;
         }
 
-        bool need_combine = false;
-        for (int i = 0; i < t->num_columns(); i++) {
-            auto c = t->column(i);
-            if (c && c->num_chunks() > 1) { need_combine = true; break; }
-        }
-        if (need_combine) {
-            auto combined = t->CombineChunks(arrow::default_memory_pool());
-            if (!combined.ok()) {
-                set_err(h, std::string("CombineChunks failed: ") + combined.status().ToString());
-                return -21;
-            }
-            t = *combined;
-        }
-
         // requested cols are first ncols columns in t (same order as read_cols)
         for (int32_t i = 0; i < ncols; i++) {
             auto chunked = t->column((int)i);
@@ -631,9 +631,7 @@ int pq_read_rows_f32(
 
         if (need_x_load && time_pos >= 0) {
             auto tcol = t->column(time_pos);
-            if (tcol) {
-                copy_chunked_time_into(h, tcol, src_off, take, dst_off);
-            }
+            if (tcol) copy_chunked_time_into(h, tcol, src_off, take, dst_off);
         }
     }
 
