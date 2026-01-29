@@ -9,11 +9,13 @@
 #include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <parquet/arrow/reader.h>
+#include <parquet/file_reader.h>
 
 struct pqh {
     std::string last_error;
 
-    std::shared_ptr<arrow::Table> table;
+    std::shared_ptr<arrow::io::RandomAccessFile> file;
+    std::unique_ptr<parquet::arrow::FileReader> reader;
     std::shared_ptr<arrow::Schema> schema;
 
     std::vector<std::string> names; // stable storage for pq_column_name()
@@ -21,10 +23,19 @@ struct pqh {
     int64_t num_rows;
     int time_col; // -1 if none
 
+    // Row group layout (prefix sums): map global row -> row group.
+    std::vector<int64_t> rg_row0;
+    std::vector<int64_t> rg_nrows;
+
     // Output buffers valid until next pq_read_rows_f32()
     std::vector<std::vector<float> > col_bufs; // [ncols][nrows]
     std::vector<const float*> col_ptrs;        // [ncols]
-    std::vector<double> x_buf;                 // [nrows] if time_col >= 0
+    std::vector<double> x_buf;                 // cached X (time) or per-call
+
+    // X cache key (valid when x_cached == true)
+    bool x_cached;
+    int64_t x_row0;
+    int32_t x_nrows;
 };
 
 static void set_err(pqh* h, const std::string& s) { if (h) h->last_error = s; }
@@ -71,11 +82,17 @@ pqh_t* pq_open(const char* parquet_path) {
 
     std::unique_ptr<pqh> h(new pqh());
     h->last_error.clear();
-    h->table.reset();
+    h->file.reset();
+    h->reader.reset();
     h->schema.reset();
     h->names.clear();
     h->num_rows = 0;
     h->time_col = -1;
+    h->rg_row0.clear();
+    h->rg_nrows.clear();
+    h->x_cached = false;
+    h->x_row0 = 0;
+    h->x_nrows = 0;
 
     // Open file
     auto maybe_file = arrow::io::ReadableFile::Open(parquet_path);
@@ -83,12 +100,12 @@ pqh_t* pq_open(const char* parquet_path) {
         set_err(h.get(), maybe_file.status().ToString());
         return NULL;
     }
-    std::shared_ptr<arrow::io::RandomAccessFile> file = *maybe_file;
+    h->file = *maybe_file;
 
     // Build Parquet reader (version-tolerant)
     std::unique_ptr<parquet::ParquetFileReader> pq_reader;
     try {
-        pq_reader = parquet::ParquetFileReader::Open(file);
+        pq_reader = parquet::ParquetFileReader::Open(h->file);
     } catch (const std::exception& e) {
         set_err(h.get(), std::string("ParquetFileReader::Open failed: ") + e.what());
         return NULL;
@@ -108,30 +125,35 @@ pqh_t* pq_open(const char* parquet_path) {
         return NULL;
     }
 
-    // Read whole table (simple)
-    std::shared_ptr<arrow::Table> table;
-    st = reader->ReadTable(&table);
-    if (!st.ok()) {
+    h->reader = std::move(reader);
+
+    // Read schema only (no data)
+    std::shared_ptr<arrow::Schema> schema;
+    st = h->reader->GetSchema(&schema);
+    if (!st.ok() || !schema) {
         set_err(h.get(), st.ToString());
         return NULL;
     }
-    if (!table) {
-        set_err(h.get(), "ReadTable returned NULL table");
-        return NULL;
-    }
-
-    // Ensure single chunk per column (keeps the rest of the code simple/correct)
-    auto combined_result = table->CombineChunks(arrow::default_memory_pool());
-    if (!combined_result.ok()) {
-        set_err(h.get(), combined_result.status().ToString());
-        return NULL;
-    }
-    table = *combined_result;
-
-    h->table = table;
-    h->schema = table->schema();
-    h->num_rows = table->num_rows();
+    h->schema = schema;
     h->time_col = detect_time_column(h->schema);
+
+    // Row group metadata (no data)
+    auto md = h->reader->parquet_reader()->metadata();
+    if (!md) {
+        set_err(h.get(), "Parquet metadata is NULL");
+        return NULL;
+    }
+    h->num_rows = md->num_rows();
+    const int nrg = md->num_row_groups();
+    h->rg_row0.resize((size_t)nrg);
+    h->rg_nrows.resize((size_t)nrg);
+    int64_t acc = 0;
+    for (int rg = 0; rg < nrg; rg++) {
+        const int64_t n = md->RowGroup(rg)->num_rows();
+        h->rg_row0[(size_t)rg] = acc;
+        h->rg_nrows[(size_t)rg] = n;
+        acc += n;
+    }
 
     // Cache stable column names
     h->names.resize((size_t)h->schema->num_fields());
@@ -231,6 +253,51 @@ static void fill_x_buf(pqh* h,
     }
 }
 
+// Offset-aware x fill (copy slice from row group array into output x_buf)
+static void fill_x_buf_into(pqh* h,
+    const std::shared_ptr<arrow::Array>& arr,
+    int64_t src_off,
+    int32_t nrows,
+    int64_t dst_off) {
+    if (!h || !arr) return;
+
+    const auto id = arr->type_id();
+
+    if (id == arrow::Type::INT64) {
+        auto a = std::static_pointer_cast<arrow::Int64Array>(arr);
+        for (int32_t i = 0; i < nrows; i++) {
+            const int64_t si = src_off + (int64_t)i;
+            const int64_t di = dst_off + (int64_t)i;
+            if (si < 0 || si >= a->length() || a->IsNull(si)) {
+                h->x_buf[(size_t)di] = std::numeric_limits<double>::quiet_NaN();
+            } else {
+                h->x_buf[(size_t)di] = int64_time_to_seconds(a->Value(si));
+            }
+        }
+        return;
+    }
+
+    if (id == arrow::Type::TIMESTAMP) {
+        auto a = std::static_pointer_cast<arrow::TimestampArray>(arr);
+        auto ts_type = std::static_pointer_cast<arrow::TimestampType>(arr->type());
+        for (int32_t i = 0; i < nrows; i++) {
+            const int64_t si = src_off + (int64_t)i;
+            const int64_t di = dst_off + (int64_t)i;
+            if (si < 0 || si >= a->length() || a->IsNull(si)) {
+                h->x_buf[(size_t)di] = std::numeric_limits<double>::quiet_NaN();
+            } else {
+                h->x_buf[(size_t)di] = timestamp_value_to_seconds(*ts_type, a->Value(si));
+            }
+        }
+        return;
+    }
+
+    for (int32_t i = 0; i < nrows; i++) {
+        const int64_t di = dst_off + (int64_t)i;
+        h->x_buf[(size_t)di] = std::numeric_limits<double>::quiet_NaN();
+    }
+}
+
 // ---- numeric -> float32 ----
 
 template <typename ArrowArrayT, typename GetValueFn>
@@ -253,41 +320,82 @@ static void cast_numeric_to_f32(const std::shared_ptr<arrow::Array>& arr,
     }
 }
 
-static int col_to_f32(pqh* h, int col_index, int64_t row0, int32_t nrows, std::vector<float>& out) {
-    if (!h || !h->table) return -1;
-    if (col_index < 0 || col_index >= h->table->num_columns()) return -2;
+template <typename ArrowArrayT, typename GetValueFn>
+static void cast_numeric_to_f32_into(
+    const std::shared_ptr<arrow::Array>& arr,
+    int64_t src_off,
+    int32_t nrows,
+    float* dst,
+    int64_t dst_off,
+    GetValueFn get_value) {
+    const float qnan = std::numeric_limits<float>::quiet_NaN();
+    auto a = std::static_pointer_cast<ArrowArrayT>(arr);
 
-    auto chunked = h->table->column(col_index);
-    if (!chunked || chunked->num_chunks() <= 0) return -3;
+    for (int32_t i = 0; i < nrows; i++) {
+        const int64_t si = src_off + (int64_t)i;
+        const int64_t di = dst_off + (int64_t)i;
+        if (si < 0 || si >= a->length() || a->IsNull(si)) {
+            dst[di] = qnan;
+        } else {
+            dst[di] = (float)get_value(a.get(), si);
+        }
+    }
+}
 
-    // Simplification: first chunk only
-    auto arr = chunked->chunk(0);
-    if (!arr) return -4;
+static int array_to_f32_into(
+    const std::shared_ptr<arrow::Array>& arr,
+    int64_t src_off,
+    int32_t nrows,
+    float* dst,
+    int64_t dst_off) {
+    if (!arr || !dst) return -1;
 
     switch (arr->type_id()) {
     case arrow::Type::BOOL:
-        cast_numeric_to_f32<arrow::BooleanArray>(arr, row0, nrows, out,
+        cast_numeric_to_f32_into<arrow::BooleanArray>(arr, src_off, nrows, dst, dst_off,
             [](const arrow::BooleanArray* a, int64_t i) -> int { return a->Value(i) ? 1 : 0; });
         return 0;
     case arrow::Type::INT32:
-        cast_numeric_to_f32<arrow::Int32Array>(arr, row0, nrows, out,
+        cast_numeric_to_f32_into<arrow::Int32Array>(arr, src_off, nrows, dst, dst_off,
             [](const arrow::Int32Array* a, int64_t i) -> int32_t { return a->Value(i); });
         return 0;
     case arrow::Type::INT64:
-        cast_numeric_to_f32<arrow::Int64Array>(arr, row0, nrows, out,
+        cast_numeric_to_f32_into<arrow::Int64Array>(arr, src_off, nrows, dst, dst_off,
             [](const arrow::Int64Array* a, int64_t i) -> int64_t { return a->Value(i); });
         return 0;
     case arrow::Type::FLOAT:
-        cast_numeric_to_f32<arrow::FloatArray>(arr, row0, nrows, out,
+        cast_numeric_to_f32_into<arrow::FloatArray>(arr, src_off, nrows, dst, dst_off,
             [](const arrow::FloatArray* a, int64_t i) -> float { return a->Value(i); });
         return 0;
     case arrow::Type::DOUBLE:
-        cast_numeric_to_f32<arrow::DoubleArray>(arr, row0, nrows, out,
+        cast_numeric_to_f32_into<arrow::DoubleArray>(arr, src_off, nrows, dst, dst_off,
             [](const arrow::DoubleArray* a, int64_t i) -> double { return a->Value(i); });
         return 0;
     default:
         return -10;
     }
+}
+
+static int find_rg_for_row(const pqh* h, int64_t row) {
+    int lo = 0;
+    int hi = (int)h->rg_row0.size();
+    while (lo + 1 < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (h->rg_row0[(size_t)mid] <= row) lo = mid;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static arrow::Status read_rowgroup_cols(
+    parquet::arrow::FileReader* r,
+    int row_group,
+    const std::vector<int>& col_indices,
+    std::shared_ptr<arrow::Table>* out) {
+    if (!r || !out) return arrow::Status::Invalid("null");
+    auto rg = r->RowGroup(row_group);
+    if (!rg) return arrow::Status::Invalid("RowGroup() returned null");
+    return rg->ReadTable(col_indices, out);
 }
 
 int pq_read_rows_f32(
@@ -302,7 +410,7 @@ int pq_read_rows_f32(
 
     pqh* h = reinterpret_cast<pqh*>(hh);
 
-    if (!h || !h->table) return -1;
+    if (!h || !h->reader || !h->schema) return -1;
     if (!cols || ncols <= 0) return -2;
     if (!out_cols || !out_nrows) return -3;
     if (row0 < 0) return -4;
@@ -319,42 +427,118 @@ int pq_read_rows_f32(
     int32_t nrows = nrows_req;
     if ((int64_t)nrows > remaining) nrows = (int32_t)remaining;
 
-    h->col_bufs.assign((size_t)ncols, std::vector<float>());
+    h->col_bufs.assign((size_t)ncols, std::vector<float>((size_t)nrows, std::numeric_limits<float>::quiet_NaN()));
     h->col_ptrs.assign((size_t)ncols, (const float*)NULL);
 
     for (int32_t i = 0; i < ncols; i++) {
-        h->col_bufs[(size_t)i].assign((size_t)nrows, 0.0f);
-
-        const int col_index = cols[i];
-        const int rc = col_to_f32(h, col_index, row0, nrows, h->col_bufs[(size_t)i]);
-        if (rc < 0) {
-            set_err(h, "Unsupported type or failed conversion at column index " + std::to_string(col_index));
-            return -20;
-        }
         h->col_ptrs[(size_t)i] = h->col_bufs[(size_t)i].data();
     }
 
-    if (out_x) {
-        if (h->time_col >= 0) {
-            h->x_buf.assign((size_t)nrows, std::numeric_limits<double>::quiet_NaN());
+    const bool want_x = (out_x != NULL);
+    const bool have_time = (h->time_col >= 0);
 
-            auto chunked = h->table->column(h->time_col);
-            if (chunked && chunked->num_chunks() > 0) {
-                auto arr = chunked->chunk(0);
-                fill_x_buf(h, arr, row0, nrows);
-                *out_x = h->x_buf.data();
+    // Decide whether we need to (re)load X or can reuse cached X.
+    bool need_x_load = false;
+    if (want_x && have_time) {
+        if (h->x_cached && h->x_row0 == row0 && h->x_nrows == nrows && (int32_t)h->x_buf.size() == nrows) {
+            // cache hit
+            need_x_load = false;
+        } else {
+            // cache miss: allocate/refresh x_buf for this interval
+            need_x_load = true;
+            h->x_buf.assign((size_t)nrows, std::numeric_limits<double>::quiet_NaN());
+            h->x_cached = true;
+            h->x_row0 = row0;
+            h->x_nrows = nrows;
+        }
+    } else {
+        // not requested or no time col -> don't promise cached x
+        need_x_load = false;
+        // keep x_buf as-is (could be useful for later calls); just don't return it unless applicable
+    }
+
+    const int64_t row1 = row0 + (int64_t)nrows - 1;
+    const int rg_first = find_rg_for_row(h, row0);
+    const int rg_last = find_rg_for_row(h, row1);
+
+    // read_cols = requested cols (+ time_col if needed)
+    std::vector<int> read_cols;
+    read_cols.reserve((size_t)ncols + 1);
+    for (int32_t i = 0; i < ncols; i++) {
+        const int c = cols[i];
+        if (c < 0 || c >= h->schema->num_fields()) {
+            set_err(h, "Column index out of range: " + std::to_string(c));
+            return -6;
+        }
+        read_cols.push_back(c);
+    }
+    int time_pos = -1;
+    if (need_x_load) {
+        bool have = false;
+        for (int i = 0; i < (int)read_cols.size(); i++) {
+            if (read_cols[(size_t)i] == h->time_col) { have = true; time_pos = i; break; }
+        }
+        if (!have) { time_pos = (int)read_cols.size(); read_cols.push_back(h->time_col); }
+    }
+
+    for (int rg = rg_first; rg <= rg_last; rg++) {
+        const int64_t rg0 = h->rg_row0[(size_t)rg];
+        const int64_t rgN = h->rg_nrows[(size_t)rg];
+        if (rgN <= 0) continue;
+
+        // intersection of [row0,row1] and this RG
+        const int64_t want0 = (row0 > rg0) ? row0 : rg0;
+        const int64_t want1 = (row1 < (rg0 + rgN - 1)) ? row1 : (rg0 + rgN - 1);
+        const int32_t take = (int32_t)(want1 - want0 + 1);
+        const int64_t src_off = want0 - rg0;  // inside RG
+        const int64_t dst_off = want0 - row0; // inside output buffers
+
+        std::shared_ptr<arrow::Table> t;
+        auto st = read_rowgroup_cols(h->reader.get(), rg, read_cols, &t);
+        if (!st.ok() || !t) {
+            set_err(h, std::string("RowGroup::ReadTable failed: ") + st.ToString());
+            return -20;
+        }
+
+        // Simplify: ensure single chunk per column for this RG table
+        auto combined = t->CombineChunks(arrow::default_memory_pool());
+        if (!combined.ok()) {
+            set_err(h, std::string("CombineChunks failed: ") + combined.status().ToString());
+            return -21;
+        }
+        t = *combined;
+
+        // requested cols are first ncols columns in t (same order as read_cols)
+        for (int32_t i = 0; i < ncols; i++) {
+            auto chunked = t->column((int)i);
+            if (!chunked || chunked->num_chunks() <= 0) {
+                set_err(h, "Missing chunk for requested column");
+                return -22;
             }
-            else {
-                *out_x = NULL;
+            auto arr = chunked->chunk(0);
+            const int rc = array_to_f32_into(arr, src_off, take,
+                h->col_bufs[(size_t)i].data(), dst_off);
+            if (rc < 0) {
+                set_err(h, "Unsupported type or failed conversion at column index " + std::to_string(cols[i]));
+                return -23;
             }
         }
-        else {
-            *out_x = NULL;
+
+        if (need_x_load && time_pos >= 0) {
+            auto chunked = t->column(time_pos);
+            if (chunked && chunked->num_chunks() > 0) {
+                fill_x_buf_into(h, chunked->chunk(0), src_off, take, dst_off);
+            }
         }
     }
 
     *out_nrows = nrows;
     *out_cols = (const float**)h->col_ptrs.data();
+    if (out_x) {
+        if (want_x && have_time && h->x_cached && h->x_row0 == row0 && h->x_nrows == nrows && !h->x_buf.empty())
+            *out_x = h->x_buf.data();
+        else *out_x = NULL;
+    }
     return nrows;
 }
 
