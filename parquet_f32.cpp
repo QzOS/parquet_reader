@@ -86,7 +86,7 @@ pqh_t* pq_open(const char* parquet_path) {
     std::shared_ptr<arrow::io::RandomAccessFile> file = *maybe_file;
 
     // Build Parquet reader (version-tolerant)
-    std::shared_ptr<parquet::ParquetFileReader> pq_reader;
+    std::unique_ptr<parquet::ParquetFileReader> pq_reader;
     try {
         pq_reader = parquet::ParquetFileReader::Open(file);
     } catch (const std::exception& e) {
@@ -121,11 +121,12 @@ pqh_t* pq_open(const char* parquet_path) {
     }
 
     // Ensure single chunk per column (keeps the rest of the code simple/correct)
-    st = table->CombineChunks(arrow::default_memory_pool(), &table);
-    if (!st.ok()) {
-        set_err(h.get(), st.ToString());
+    auto combined_result = table->CombineChunks(arrow::default_memory_pool());
+    if (!combined_result.ok()) {
+        set_err(h.get(), combined_result.status().ToString());
         return NULL;
     }
+    table = *combined_result;
 
     h->table = table;
     h->schema = table->schema();
