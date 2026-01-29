@@ -24,8 +24,8 @@ if(NOT Arrow_FOUND OR NOT Parquet_FOUND)
   message(STATUS "Arrow/Parquet not found. Fetching Apache Arrow...")
   set(ARROW_BUILD_SHARED ON CACHE BOOL "" FORCE)
   set(ARROW_BUILD_STATIC OFF CACHE BOOL "" FORCE)
-  # IPC not needed for this project; keep OFF to reduce build time.
-  set(ARROW_IPC OFF CACHE BOOL "" FORCE)
+  # IPC is required for Parquet reader/writer functionality.
+  set(ARROW_IPC ON CACHE BOOL "" FORCE)
   set(ARROW_PARQUET ON CACHE BOOL "" FORCE)
   set(ARROW_SIMD_LEVEL "NONE" CACHE STRING "" FORCE)
   set(ARROW_WITH_BZ2 OFF CACHE BOOL "" FORCE)
@@ -35,7 +35,7 @@ if(NOT Arrow_FOUND OR NOT Parquet_FOUND)
   # Zstd är också vanligt och bra att ha.
   set(ARROW_WITH_ZSTD ON CACHE BOOL "" FORCE)
   set(ARROW_WITH_BROTLI OFF CACHE BOOL "" FORCE)
-  set(ARROW_DEPENDENCY_SOURCE "BUNDLED" CACHE STRING "" FORCE)
+  set(ARROW_DEPENDENCY_SOURCE "AUTO" CACHE STRING "" FORCE)
 
   FetchContent_Declare(
     arrow
