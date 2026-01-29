@@ -377,6 +377,7 @@ static int array_to_f32_into(
 }
 
 static int find_rg_for_row(const pqh* h, int64_t row) {
+    if (!h || h->rg_row0.empty()) return -1;
     int lo = 0;
     int hi = (int)h->rg_row0.size();
     while (lo + 1 < hi) {
@@ -385,6 +386,101 @@ static int find_rg_for_row(const pqh* h, int64_t row) {
         else hi = mid;
     }
     return lo;
+}
+
+static int copy_chunked_to_f32_into(
+    const std::shared_ptr<arrow::ChunkedArray>& chunked,
+    int64_t src_off,
+    int32_t nrows,
+    float* dst,
+    int64_t dst_off) {
+
+    if (!chunked || !dst) return -1;
+    if (nrows <= 0) return 0;
+
+    int64_t remaining = (int64_t)nrows;
+    int64_t src = src_off;
+    int64_t dst_i = dst_off;
+
+    int64_t base = 0;
+    const int nch = chunked->num_chunks();
+    for (int ci = 0; ci < nch && remaining > 0; ci++) {
+        auto arr = chunked->chunk(ci);
+        if (!arr) continue;
+
+        const int64_t len = arr->length();
+        const int64_t chunk_start = base;
+        const int64_t chunk_end = base + len;
+
+        if (src >= chunk_end) {
+            base = chunk_end;
+            continue;
+        }
+        if (src < chunk_start) {
+            src = chunk_start;
+        }
+
+        const int64_t in_chunk_off = src - chunk_start;
+        const int64_t avail = len - in_chunk_off;
+        const int64_t take64 = (remaining < avail) ? remaining : avail;
+        const int32_t take = (int32_t)take64;
+
+        const int rc = array_to_f32_into(arr, in_chunk_off, take, dst, dst_i);
+        if (rc < 0) return rc;
+
+        remaining -= take64;
+        src += take64;
+        dst_i += take64;
+
+        base = chunk_end;
+    }
+
+    return 0;
+}
+
+static void copy_chunked_time_into(
+    pqh* h,
+    const std::shared_ptr<arrow::ChunkedArray>& chunked,
+    int64_t src_off,
+    int32_t nrows,
+    int64_t dst_off) {
+
+    if (!h || !chunked) return;
+    if (nrows <= 0) return;
+
+    int64_t remaining = (int64_t)nrows;
+    int64_t src = src_off;
+    int64_t dst_i = dst_off;
+
+    int64_t base = 0;
+    const int nch = chunked->num_chunks();
+    for (int ci = 0; ci < nch && remaining > 0; ci++) {
+        auto arr = chunked->chunk(ci);
+        if (!arr) continue;
+
+        const int64_t len = arr->length();
+        const int64_t chunk_start = base;
+        const int64_t chunk_end = base + len;
+
+        if (src >= chunk_end) {
+            base = chunk_end;
+            continue;
+        }
+        if (src < chunk_start) src = chunk_start;
+
+        const int64_t in_chunk_off = src - chunk_start;
+        const int64_t avail = len - in_chunk_off;
+        const int64_t take64 = (remaining < avail) ? remaining : avail;
+        const int32_t take = (int32_t)take64;
+
+        fill_x_buf_into(h, arr, in_chunk_off, take, dst_i);
+
+        remaining -= take64;
+        src += take64;
+        dst_i += take64;
+
+        base = chunk_end;
+    }
 }
 
 static arrow::Status read_rowgroup_cols(
@@ -460,6 +556,10 @@ int pq_read_rows_f32(
     const int64_t row1 = row0 + (int64_t)nrows - 1;
     const int rg_first = find_rg_for_row(h, row0);
     const int rg_last = find_rg_for_row(h, row1);
+    if (rg_first < 0 || rg_last < 0) {
+        set_err(h, "No row groups in file (empty parquet?)");
+        return -7;
+    }
 
     // read_cols = requested cols (+ time_col if needed)
     std::vector<int> read_cols;
@@ -500,23 +600,28 @@ int pq_read_rows_f32(
             return -20;
         }
 
-        // Simplify: ensure single chunk per column for this RG table
-        auto combined = t->CombineChunks(arrow::default_memory_pool());
-        if (!combined.ok()) {
-            set_err(h, std::string("CombineChunks failed: ") + combined.status().ToString());
-            return -21;
+        bool need_combine = false;
+        for (int i = 0; i < t->num_columns(); i++) {
+            auto c = t->column(i);
+            if (c && c->num_chunks() > 1) { need_combine = true; break; }
         }
-        t = *combined;
+        if (need_combine) {
+            auto combined = t->CombineChunks(arrow::default_memory_pool());
+            if (!combined.ok()) {
+                set_err(h, std::string("CombineChunks failed: ") + combined.status().ToString());
+                return -21;
+            }
+            t = *combined;
+        }
 
         // requested cols are first ncols columns in t (same order as read_cols)
         for (int32_t i = 0; i < ncols; i++) {
             auto chunked = t->column((int)i);
-            if (!chunked || chunked->num_chunks() <= 0) {
-                set_err(h, "Missing chunk for requested column");
+            if (!chunked) {
+                set_err(h, "Missing chunked column for requested column");
                 return -22;
             }
-            auto arr = chunked->chunk(0);
-            const int rc = array_to_f32_into(arr, src_off, take,
+            const int rc = copy_chunked_to_f32_into(chunked, src_off, take,
                 h->col_bufs[(size_t)i].data(), dst_off);
             if (rc < 0) {
                 set_err(h, "Unsupported type or failed conversion at column index " + std::to_string(cols[i]));
@@ -525,9 +630,9 @@ int pq_read_rows_f32(
         }
 
         if (need_x_load && time_pos >= 0) {
-            auto chunked = t->column(time_pos);
-            if (chunked && chunked->num_chunks() > 0) {
-                fill_x_buf_into(h, chunked->chunk(0), src_off, take, dst_off);
+            auto tcol = t->column(time_pos);
+            if (tcol) {
+                copy_chunked_time_into(h, tcol, src_off, take, dst_off);
             }
         }
     }
